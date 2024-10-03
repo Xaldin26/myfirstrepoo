@@ -1,27 +1,22 @@
 import I2C_LCD_driver
 import RPi.GPIO as GPIO
-from time import sleep
+from time import sleep, time
 import adafruit_fingerprint
 import serial
 import requests
 import datetime
 import threading
-import atexit
 
 # Initialize serial connection for Adafruit Fingerprint Sensor
-def initialize_fingerprint_sensor():
-    try:
-        uart = serial.Serial('/dev/ttyUSB0', baudrate=57600, timeout=1)
-        fingerprint_sensor = adafruit_fingerprint.Adafruit_Fingerprint(uart)
-        if fingerprint_sensor is None:
-            raise ValueError('Failed to initialize fingerprint sensor!')
-        print('Fingerprint sensor initialized successfully.')
-        return fingerprint_sensor
-    except Exception as e:
-        print('Failed to initialize fingerprint sensor:', e)
-        exit(1)
-
-fingerprint_sensor = initialize_fingerprint_sensor()
+try:
+    uart = serial.Serial('/dev/ttyUSB0', baudrate=57600, timeout=1)
+    fingerprint_sensor = adafruit_fingerprint.Adafruit_Fingerprint(uart)
+    if fingerprint_sensor is None:
+        raise ValueError('Failed to initialize fingerprint sensor!')
+    print('Fingerprint sensor initialized successfully.')
+except Exception as e:
+    print('Failed to initialize fingerprint sensor:', e)
+    exit(1)
 
 # Initialize LCD
 lcd = I2C_LCD_driver.lcd()
@@ -49,173 +44,220 @@ GPIO.setup(R3, GPIO.IN, pull_up_down=GPIO.PUD_DOWN)
 GPIO.setup(R4, GPIO.IN, pull_up_down=GPIO.PUD_DOWN)
 GPIO.setup(m5_button_pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)  # M5 button with pull-up resistor
 
-# Global variables
+keypadPressed = -1
 input_pin = ""
-consecutive_wrong_attempts = 0
+failed_attempts = 0
+consecutive_wrong_attempts = 0  # Initialize counter for wrong attempts
+alarm_triggered = False
 manual_control = False
 
-def cleanup():
-    """Ensure GPIO cleanup on exit."""
-    GPIO.cleanup()
-    print("GPIO cleaned up")
+# Debounce configuration for keypad
+debounce_time = 0.3  # 300ms debounce time
+last_keypress_time = time()
 
-atexit.register(cleanup)
-
-# Thread for lock status API check
-def check_lock_status():
-    """Fetch lock status from the API and control the relay accordingly."""
-    api_url_lock_status = 'https://lockup.pro/api/logs'
-    global manual_control
-
-    while True:
-        if not manual_control:
-            try:
-                response = requests.get(api_url_lock_status, timeout=5)
-                response.raise_for_status()
-                data = response.json()
-                status = data.get('status')
-
-                if status == 'unlocked':
-                    print('Unlocking system via API')
-                    GPIO.output(Relay, GPIO.LOW)  # Unlock the system
-                elif status == 'locked':
-                    print('Locking system via API')
-                    GPIO.output(Relay, GPIO.HIGH)  # Lock the system
-
-            except requests.RequestException as e:
-                print('Failed to fetch lock status:', e)
-
-        sleep(5)  # Check every 5 seconds
-
-# Start the lock status check in a separate thread
-lock_status_thread = threading.Thread(target=check_lock_status)
-lock_status_thread.daemon = True  # Ensure thread closes when main program exits
-lock_status_thread.start()
-
-# Function to fetch data from API
-def fetch_api_data(api_url):
-    try:
-        response = requests.get(api_url, timeout=5)
-        response.raise_for_status()
-        data = response.json()
-        return data
-    except requests.RequestException as e:
-        print(f'Failed to fetch data from API: {e}')
-        return None
-
-def fetch_temperature():
-    """Fetch the latest temperature data from the API and trigger alarm if necessary."""
-    api_url_temp = 'https://lockup.pro/api/temperatures'
-    data = fetch_api_data(api_url_temp)
-    if data:
-        latest_record = data[-1]
-        temperature = float(latest_record.get('temperature', 0))
-        humidity = float(latest_record.get('humidity', 0))
-        print(f"Fetched temperature: {temperature}°C, Humidity: {humidity}%")
-
-        if temperature >= 40:
-            print("Temperature >= 40°C. Triggering buzzer alarm!")
-            trigger_alarm()
-        return temperature, humidity
-    return None, None
+manual_control = False  # New flag to track manual control state
 
 def unlock_for_15_minutes():
     """Unlock the system for 15 minutes, then relock."""
     print("Unlocking system for 15 minutes...")
     lcd.lcd_clear()
-    lcd.lcd_display_string("System Unlocked", 1)
+    lcd.lcd_display_string("System Unlocked", 1, 0)
     GPIO.output(Relay, GPIO.LOW)  # Unlock the system
-    GPIO.output(buzzer, GPIO.HIGH)
+    GPIO.output(buzzer, GPIO.HIGH)  # Sound buzzer briefly
     sleep(0.3)
     GPIO.output(buzzer, GPIO.LOW)
 
-    sleep(900)  # 15 minutes
+    # Wait for 15 minutes (900 seconds)
+    sleep(900)
 
-    print("Relocking system after 15 minutes...")
+    # Lock the system again
+    print("15 minutes passed, locking system...")
     lcd.lcd_clear()
-    lcd.lcd_display_string("System Locked", 1)
+    lcd.lcd_display_string("System Locked", 1, 0)
     GPIO.output(Relay, GPIO.HIGH)  # Lock the system
     GPIO.output(buzzer, GPIO.HIGH)
     sleep(0.3)
     GPIO.output(buzzer, GPIO.LOW)
 
-def check_m5_button_press():
-    """Check if the M5 button is pressed and handle unlocking for 15 minutes."""
-    global manual_control
-    if GPIO.input(m5_button_pin) == GPIO.LOW:
-        print("M5 Button Pressed!")
-        manual_control = True
-        unlock_for_15_minutes()
-        manual_control = False
-
-def verify_fingerprint_and_pin(pin_input, admin=False):
-    """Common verification logic for both admin and regular user."""
-    api_url = f'https://lockup.pro/api/admin/pin/{pin_input}' if admin else f'https://lockup.pro/api/instructors/{pin_input}'
-    data = fetch_api_data(api_url)
-
-    if data is None:
-        lcd.lcd_clear()
-        lcd.lcd_display_string("PIN not found", 1)
-        return False
-
-    matched_finger_id = get_fingerprint()
-    if matched_finger_id is None:
-        lcd.lcd_clear()
-        lcd.lcd_display_string("Fingerprint Failed", 1)
-        return False
-
-    stored_finger_id = data.get('finger_id')
-    if matched_finger_id != stored_finger_id:
-        lcd.lcd_clear()
-        lcd.lcd_display_string("Access Denied", 1)
-        return False
-
-    lcd.lcd_clear()
-    lcd.lcd_display_string("Access Granted", 1)
-    GPIO.output(Relay, GPIO.LOW)
-    return True
-
-def main_loop():
-    """Main loop to handle keypad and other inputs."""
-    global input_pin
-
+def fetch_temperature():
+    """Fetch the latest temperature data from the API."""
+    api_url_temp = 'https://lockup.pro/api/temperatures'
     try:
-        while True:
-            temperature, humidity = fetch_temperature()
-            lcd.lcd_display_string("Enter Your PIN:", 1)
+        response = requests.get(api_url_temp, timeout=3)  # Set a timeout to avoid long waits
+        response.raise_for_status()
+        data = response.json()
+        
+        if not data:
+            print("No temperature data received.")
+            return None, None
+        
+        latest_record = data[-1]  # Get the last record in the list (most recent)
+        temperature = float(latest_record.get('temperature'))
+        humidity = float(latest_record.get('humidity'))
+        print(f"Fetched temperature: {temperature}°C, Humidity: {humidity}%")
+        
+        if temperature >= 40:
+            print("Temperature is >= 40°C. Triggering buzzer alarm!")
+            trigger_alarm()
+        
+        return temperature, humidity
+    except Exception as e:
+        print('Failed to fetch temperature data:', e)
+        return None, None
 
-            # Check if M5 button is pressed
-            check_m5_button_press()
+# Run API requests in a separate thread to avoid blocking the main loop
+def fetch_api_data(pin_input):
+    """Fetch instructor data from API using the provided PIN."""
+    api_url_instructor = f'https://lockup.pro/api/instructors/{pin_input}'
+    try:
+        response = requests.get(api_url_instructor, timeout=3)  # Set a timeout
+        response.raise_for_status()
+        data = response.json()
+        print('Fetched data from API:', data)
+        return data
+    except Exception as e:
+        print('Failed to fetch API data:', e)
+        return []
 
-            setAllColumns(GPIO.LOW)
-            readLine(C1, ["D", "C", "B", "A"])
-            readLine(C2, ["#", "9", "6", "3"])
-            readLine(C3, ["0", "8", "5", "2"])
-            readLine(C4, ["*", "7", "4", "1"])
+def get_fingerprint():
+    """Get a fingerprint image, template it, and see if it matches!"""
+    print("Waiting for image...")
+    while fingerprint_sensor.get_image() != adafruit_fingerprint.OK:
+        sleep(0.1)
+    print("Image detected. Templating...")
+    if fingerprint_sensor.image_2_tz(1) != adafruit_fingerprint.OK:
+        return None
+    print("Searching...")
+    result = fingerprint_sensor.finger_fast_search()
+    if result == adafruit_fingerprint.OK:
+        matched_id = fingerprint_sensor.finger_id
+        print(f"Found fingerprint with ID {matched_id}!")
+        return matched_id
+    else:
+        print("No match found")
+        return None
+
+def verify_admin_fingerprint_and_pin(pin_input):
+    """Verify admin PIN and fingerprint."""
+    try:
+        admin = fetch_api_data(pin_input)
+        if not admin:
+            lcd.lcd_clear()
+            sleep(2)
+            consecutive_wrong_attempts += 1
+            if consecutive_wrong_attempts >= 4:
+                trigger_alarm()
+                consecutive_wrong_attempts = 0
+            return False
+        
+        lcd.lcd_clear()
+        lcd.lcd_display_string("Admin Place Finger", 1, 0)
+        sleep(1)
+
+        while fingerprint_sensor.get_image() != adafruit_fingerprint.OK:
             sleep(0.1)
 
-            lcd.lcd_display_string(f"PIN: {input_pin}", 2)
+        matched_finger_id = get_fingerprint()
+        if matched_finger_id is None:
+            lcd.lcd_clear()
+            lcd.lcd_display_string("Scan Failed", 1, 0)
+            sleep(2)
+            return False
 
-            if len(input_pin) >= 4:
-                print("Input PIN:", input_pin)
+        stored_finger_id = admin.get('finger_id')
+        if stored_finger_id is None or matched_finger_id != stored_finger_id:
+            lcd.lcd_clear()
+            lcd.lcd_display_string("Admin Access Denied", 1, 0)
+            sleep(2)
+            return False
+        
+        lcd.lcd_clear()
+        lcd.lcd_display_string("Admin Access", 1, 0)
+        GPIO.output(buzzer, GPIO.HIGH)
+        sleep(0.3)
+        GPIO.output(buzzer, GPIO.LOW)
+        GPIO.output(Relay, GPIO.LOW)  # Unlock the system
+        manual_control = True
+        return True
 
-                # Verify admin first
-                if verify_fingerprint_and_pin(input_pin, admin=True):
-                    print("Admin Access granted.")
+    except Exception as e:
+        print('Error:', e)
+        return False
+
+def debounce_keypress():
+    """Debounce the keypad input to avoid multiple key registrations."""
+    global last_keypress_time
+    if time() - last_keypress_time > debounce_time:
+        last_keypress_time = time()
+        return True
+    return False
+
+def setAllColumns(state):
+    GPIO.output(C1, state)
+    GPIO.output(C2, state)
+    GPIO.output(C3, state)
+    GPIO.output(C4, state)
+
+def readLine(line, characters):
+    global input_pin
+    GPIO.output(line, GPIO.HIGH)
+    if GPIO.input(R1) == 1 and debounce_keypress():
+        input_pin += characters[0]
+    if GPIO.input(R2) == 1 and debounce_keypress():
+        input_pin += characters[1]
+    if GPIO.input(R3) == 1 and debounce_keypress():
+        input_pin += characters[2]
+    if GPIO.input(R4) == 1 and debounce_keypress():
+        input_pin += characters[3]
+    GPIO.output(line, GPIO.LOW)
+
+# Main loop
+print("Starting main loop")
+try:
+    while True:
+        # Check if the M5 button is pressed
+        if GPIO.input(m5_button_pin) == GPIO.LOW:
+            unlock_for_15_minutes()
+
+        # Fetch temperature data in a separate thread to avoid blocking
+        temperature_thread = threading.Thread(target=fetch_temperature)
+        temperature_thread.start()
+
+        # Wait for keypad input
+        lcd.lcd_display_string("Enter Your PIN:", 1, 0)
+        setAllColumns(GPIO.LOW)
+        readLine(C1, ["D", "C", "B", "A"])  # Assign D button for clearing input
+        readLine(C2, ["#", "9", "6", "3"])
+        readLine(C3, ["0", "8", "5", "2"])
+        readLine(C4, ["*", "7", "4", "1"])
+        sleep(0.1)
+
+        # Update the LCD with the input PIN
+        lcd.lcd_display_string(f"PIN: {input_pin.ljust(4, '*')}", 2, 0)
+
+        # Limit input PIN to 4 digits
+        if len(input_pin) >= 4:
+            print("Input PIN:", input_pin)
+
+            # First check if the PIN belongs to an admin
+            if verify_admin_fingerprint_and_pin(input_pin):
+                print("Admin Access granted.")
+            else:
+                # If not an admin, proceed with regular verification
+                instructors = fetch_api_data(input_pin)
+                if not instructors:
+                    lcd.lcd_clear()
+                    lcd.lcd_display_string("Access Denied", 1, 0)
+                    print("Access denied.")
                 else:
-                    # Regular user verification
-                    if verify_fingerprint_and_pin(input_pin):
-                        print("Access granted.")
-                    else:
-                        print("Access denied.")
+                    print("Access granted.")
 
-                input_pin = ""  # Reset input_pin after checking
-                lcd.lcd_clear()
-                sleep(0.1)
+            input_pin = ""  # Reset input PIN after checking
+            lcd.lcd_clear()  # Clear LCD after checking
+            sleep(1)
 
-    except KeyboardInterrupt:
-        print("Terminated by user")
-
-# Main entry point
-if __name__ == "__main__":
-    main_loop()
+except KeyboardInterrupt:
+    print("Terminated by user")
+finally:
+    GPIO.cleanup()
+    print("Cleaned up GPIO pins")
